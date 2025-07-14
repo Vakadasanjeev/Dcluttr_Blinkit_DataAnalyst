@@ -1,0 +1,75 @@
+1) SQL Query
+
+CREATE TABLE blinkit_city_insights AS
+WITH inv_movement AS (
+    SELECT 
+        abs.store_id,
+        abs.sku_id,
+        abs.created_at::date AS date,
+        abs.created_at,
+        abs.inventory,
+        abs.selling_price,
+        abs.mrp,
+        abs.brand_id,
+        abs.brand,
+        abs.image_url,
+        abs.l1_category_id,
+        abs.l2_category_id,
+        abs.sku_name,
+        abs.inventory - LAG(abs.inventory) OVER (
+            PARTITION BY abs.store_id, abs.sku_id ORDER BY abs.created_at
+        ) AS inventory_diff
+    FROM all_blinkit_category_scraping_stream abs
+),
+filtered_inv AS (
+    SELECT im.*, bcm.city_name
+    FROM inv_movement im
+    JOIN blinkit_city_map bcm ON im.store_id = bcm.store_id
+),
+estimation AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN inventory_diff < 0 THEN ABS(inventory_diff)
+            ELSE 0
+        END AS est_qty_sold
+    FROM filtered_inv
+),
+final_metrics AS (
+    SELECT
+        est.date,
+        est.brand_id,
+        est.brand,
+        est.image_url,
+        est.city_name,
+        est.sku_id,
+        est.sku_name,
+        cat.l1_category_id AS category_id,
+        cat.l1_category AS category_name,
+        cat.l2_category_id AS sub_category_id,
+        cat.l2_category AS sub_category_name,
+        SUM(est.est_qty_sold) AS est_qty_sold,
+        SUM(est.est_qty_sold * est.selling_price) AS est_sales_sp,
+        SUM(est.est_qty_sold * est.mrp) AS est_sales_mrp,
+        COUNT(DISTINCT est.store_id) AS listed_ds_count,
+        (SELECT COUNT(DISTINCT store_id) FROM blinkit_city_map) AS ds_count,
+        COUNT(*) FILTER (WHERE est.inventory > 0)::FLOAT /
+            (SELECT COUNT(DISTINCT store_id) FROM blinkit_city_map) AS wt_osa,
+        COUNT(*) FILTER (WHERE est.inventory > 0)::FLOAT / COUNT(DISTINCT est.store_id) AS wt_osa_ls,
+        MODE() WITHIN GROUP (ORDER BY est.mrp) AS mrp,
+        MODE() WITHIN GROUP (ORDER BY est.selling_price) AS sp,
+        CASE 
+            WHEN MODE() WITHIN GROUP (ORDER BY est.mrp) = 0 THEN 0
+            ELSE ROUND(
+                (MODE() WITHIN GROUP (ORDER BY est.mrp) - MODE() WITHIN GROUP (ORDER BY est.selling_price))::NUMERIC /
+                MODE() WITHIN GROUP (ORDER BY est.mrp), 2
+            )
+        END AS discount
+    FROM estimation est
+    JOIN blinkit_categories cat ON est.l2_category_id = cat.l2_category_id
+    GROUP BY est.date, est.brand_id, est.brand, est.image_url, est.city_name,
+             est.sku_id, est.sku_name, cat.l1_category_id, cat.l1_category,
+             cat.l2_category_id, cat.l2_category
+)
+
+SELECT * FROM final_metrics;
